@@ -174,11 +174,11 @@ Vector<String> generate_env(StringView cmdline, ConstArrayView<String> params, c
     return env;
 }
 
-template<typename OnClose>
-FDWatcher make_reader(int fd, String& contents, OnClose&& on_close)
+FDWatcher make_reader(int fd, EventMode mode, String& contents,
+                      MoveOnlyFunction<void (FDWatcher& watcher, int error)> on_close)
 {
-    return {fd, FdEvents::Read, EventMode::Urgent,
-            [&contents, on_close](FDWatcher& watcher, FdEvents, EventMode) {
+    return {fd, FdEvents::Read, mode,
+            [&contents, on_close = std::move(on_close)](FDWatcher& watcher, FdEvents, EventMode) {
         const int fd = watcher.fd();
         char buffer[1024];
         while (fd_readable(fd))
@@ -189,8 +189,9 @@ FDWatcher make_reader(int fd, String& contents, OnClose&& on_close)
                 if (size < 0 and errno == EAGAIN)
                     continue; // try again
 
+                const int error = size < 0 ? errno : 0;
                 watcher.disable();
-                on_close(size == 0);
+                on_close(watcher, error);
                 return;
             }
             contents += StringView{buffer, buffer+size};
@@ -230,43 +231,155 @@ struct CommandFifos
 {
     String base_dir;
     String command;
-    FDWatcher command_watcher;
+    UniqueFd command_fd;
 
-    CommandFifos(Context& context, const ShellContext& shell_context)
-      : base_dir(format("{}/kak-fifo.XXXXXX", tmpdir())),
-        command_watcher([&] {
-            if (mkdtemp(base_dir.data()) == nullptr or
-                mkfifo(command_fifo_path().c_str(), 0600) != 0 or
-                mkfifo(response_fifo_path().c_str(), 0600) != 0)
-                throw runtime_error(format("unable to create command/response fifos, errno: {}", ::strerror(errno)));
-
-            int fd = open(command_fifo_path().c_str(), O_RDONLY | O_NONBLOCK);
-            return make_reader(fd, command, [&, fd](bool graceful) {
-                if (not graceful)
-                {
-                    write_to_debug_buffer(format("error reading from command fifo '{}'", strerror(errno)));
-                    return;
-                }
-                CommandManager::instance().execute(command, context, shell_context);
-                command.clear();
-                command_watcher.reset_fd(fd);
-            });
-        }())
+    CommandFifos()
+      : base_dir(format("{}/kak-fifo.XXXXXX", tmpdir()))
     {
+        if (mkdtemp(base_dir.data()) == nullptr or
+            mkfifo(command_fifo_path().c_str(), 0600) != 0 or
+            mkfifo(response_fifo_path().c_str(), 0600) != 0)
+            throw runtime_error(format("unable to create command/response fifos, errno: {}", ::strerror(errno)));
+
+        command_fd = UniqueFd{open(command_fifo_path().c_str(), O_RDONLY | O_NONBLOCK)};
     }
 
     ~CommandFifos()
     {
-        command_watcher.close_fd();
+        // it it important that we unlink the command_fifo *before* we close
+        // the command_fd (through the destructor of UniqueFd). This ensures
+        // that a writer to the fifo will either get ENOENT because the fifo
+        // was unlinked or EPIPE/SIGPIPE because the other end of an open
+        // command fifo closed.
         unlink(command_fifo_path().c_str());
         unlink(response_fifo_path().c_str());
         rmdir(base_dir.c_str());
+    }
+
+    // Calls execute with each command written to the command fifo, a command
+    // ends once the fifo is closed by all its writers.
+    FDWatcher watch(EventMode mode, MoveOnlyFunction<void (StringView command)> execute)
+    {
+        return make_reader((int)command_fd, mode, command,
+                           [this, execute = std::move(execute)](FDWatcher& watcher, int error) {
+            if (error != 0)
+            {
+                write_to_debug_buffer(format("error reading from command fifo '{}'", strerror(error)));
+                return;
+            }
+
+            auto rearm = OnScopeEnd([&] {
+                command.clear();
+                // The fifo keeps reporting eof until another writer opens it,
+                // reopen it to wait for that writer. The previous descriptor
+                // gets closed after the new one is opened so that the fifo
+                // always has a reader.
+                command_fd = UniqueFd{open(command_fifo_path().c_str(), O_RDONLY | O_NONBLOCK)};
+                if (not command_fd)
+                    write_to_debug_buffer(format("error reopening command fifo '{}'", strerror(errno)));
+                watcher.reset_fd((int)command_fd);
+            });
+
+            execute(command);
+        });
     }
 
     String command_fifo_path() const { return format("{}/command-fifo", base_dir); }
     String response_fifo_path() const { return format("{}/response-fifo", base_dir); }
 };
 
+}
+
+// A background job is what remains of a shell command whose stderr is still
+// open once its stdout got closed. Until that stderr gets closed, it is
+// forwarded to the debug buffer and the command fifo keeps accepting commands.
+struct ShellManager::BackgroundJob
+{
+    BackgroundJob(UniqueFd err, UniquePtr<CommandFifos> fifos)
+      : m_err{std::move(err)}, m_fifos{std::move(fifos)},
+        m_fifo_watcher{m_fifos ? new FDWatcher(m_fifos->watch(EventMode::Normal, execute)) : nullptr},
+        m_err_watcher{(int)m_err, FdEvents::Read, EventMode::Normal,
+                      [this](FDWatcher&, FdEvents, EventMode) { read_stderr(); }}
+    {
+    }
+
+    String debug_description() const
+    {
+        if (not m_fifos)
+            return format("stderr fd: {}", (int)m_err);
+        return format("stderr fd: {}\ncommand fd: {}\nfifo directory: {}",
+                      (int)m_err, (int)m_fifos->command_fd, m_fifos->base_dir);
+    }
+
+private:
+    static void execute(StringView command)
+    {
+        try
+        {
+            Context context{Context::EmptyContextFlag{}};
+            CommandManager::instance().execute(command, context);
+        }
+        catch (const runtime_error& error)
+        {
+            write_to_debug_buffer(format("error running command '{}': {}", command, error.what()));
+        }
+    }
+
+    void read_stderr()
+    {
+        const int fd = (int)m_err;
+        char buffer[1024];
+        while (fd_readable(fd))
+        {
+            ssize_t size = ::read(fd, buffer, sizeof(buffer));
+            if (size < 0 and errno == EAGAIN)
+                continue; // try again
+
+            if (size <= 0)
+            {
+                report_stderr(m_err_contents.length());
+                ShellManager::instance().remove_background_job(this);
+                return; // this got destroyed
+            }
+            m_err_contents += StringView{buffer, buffer+size};
+        }
+
+        // only report complete lines
+        ByteCount end = m_err_contents.length();
+        while (end > 0 and m_err_contents[end-1] != '\n')
+            --end;
+        report_stderr(end);
+    }
+
+    void report_stderr(ByteCount count)
+    {
+        if (count == 0)
+            return;
+        write_to_debug_buffer(format("shell stderr: <<<\n{}>>>", m_err_contents.substr(0_byte, count)));
+        m_err_contents = m_err_contents.substr(count).str();
+    }
+
+    UniqueFd m_err;
+    String m_err_contents;
+    UniquePtr<CommandFifos> m_fifos;
+    UniquePtr<FDWatcher> m_fifo_watcher;
+    FDWatcher m_err_watcher;
+};
+
+ShellManager::~ShellManager() = default;
+
+void ShellManager::remove_background_job(BackgroundJob* job)
+{
+    auto it = find_if(m_background_jobs, [job](auto& j) { return j.get() == job; });
+    kak_assert(it != m_background_jobs.end());
+    m_background_jobs.erase(it);
+}
+
+void ShellManager::debug_background_jobs() const
+{
+    write_to_debug_buffer("Background jobs:");
+    for (auto& job : m_background_jobs)
+        write_to_debug_buffer(job->debug_description());
 }
 
 std::pair<String, int> ShellManager::eval(
@@ -280,13 +393,19 @@ std::pair<String, int> ShellManager::eval(
 
     auto start_time = profile ? Clock::now() : Clock::time_point{};
 
-    Optional<CommandFifos> command_fifos;
+    UniquePtr<CommandFifos> command_fifos;
+    UniquePtr<FDWatcher> command_watcher;
 
     auto kak_env = generate_env(cmdline, shell_context.params, context, [&](StringView name, Quoting quoting) {
         if (name == "command_fifo" or name == "response_fifo")
         {
             if (not command_fifos)
-                command_fifos.emplace(const_cast<Context&>(context), shell_context);
+            {
+                command_fifos = make_unique_ptr<CommandFifos>();
+                command_watcher.reset(new FDWatcher(command_fifos->watch(EventMode::Urgent, [&](StringView command) {
+                    CommandManager::instance().execute(command, const_cast<Context&>(context), shell_context);
+                })));
+            }
             return name == "command_fifo" ?
                 command_fifos->command_fifo_path() : command_fifos->response_fifo_path();
         }
@@ -301,8 +420,10 @@ std::pair<String, int> ShellManager::eval(
     auto wait_time = Clock::now();
 
     String stdout_contents, stderr_contents;
-    auto stdout_reader = make_reader((int)shell.out, stdout_contents, [&](bool){ shell.out.close(); });
-    auto stderr_reader = make_reader((int)shell.err, stderr_contents, [&](bool){ shell.err.close(); });
+    auto stdout_reader = make_reader((int)shell.out, EventMode::Urgent, stdout_contents,
+                                     [&](FDWatcher&, int){ shell.out.close(); });
+    auto stderr_reader = make_reader((int)shell.err, EventMode::Urgent, stderr_contents,
+                                     [&](FDWatcher&, int){ shell.err.close(); });
     auto stdin_writer = make_pipe_writer(shell.in, input_generator);
 
     // block SIGCHLD to make sure we wont receive it before
@@ -327,7 +448,7 @@ std::pair<String, int> ShellManager::eval(
 
     bool cancelling = false;
     while (not terminated or shell.in or
-           ((flags & Flags::WaitForStdout) and (shell.out or shell.err)))
+           ((flags & Flags::WaitForStdout) and shell.out))
     {
         try
         {
@@ -362,6 +483,15 @@ std::pair<String, int> ShellManager::eval(
 
     if (cancelling)
         throw cancel{};
+
+    if ((flags & Flags::WaitForStdout) and shell.err)
+    {
+        stderr_reader.disable();
+        command_watcher.reset();
+        m_background_jobs.push_back(make_unique_ptr<BackgroundJob>(std::move(shell.err), std::move(command_fifos)));
+    }
+    else if (command_fifos and not command_fifos->command.empty())
+        write_to_debug_buffer(format("discarding unterminated command fifo content: <<<\n{}>>>", command_fifos->command));
 
     return { std::move(stdout_contents), WIFEXITED(status) ? WEXITSTATUS(status) : -1 };
 }

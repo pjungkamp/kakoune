@@ -33,7 +33,7 @@ constexpr bool with_bit_ops(Meta::Type<FdEvents>) { return true; }
 class FDWatcher
 {
 public:
-    using Callback = Function<void (FDWatcher& watcher, FdEvents events, EventMode mode)>;
+    using Callback = MoveOnlyFunction<void (FDWatcher& watcher, FdEvents events, EventMode mode)>;
     FDWatcher(int fd, FdEvents events, EventMode mode, Callback callback);
     FDWatcher(const FDWatcher&) = delete;
     FDWatcher& operator=(const FDWatcher&) = delete;

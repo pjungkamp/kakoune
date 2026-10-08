@@ -1609,7 +1609,8 @@ const CommandDesc debug_cmd = {
     make_completer(
         [](const Context& context, StringView prefix, ByteCount cursor_pos) -> Completions {
                auto c = {"info", "buffers", "options", "memory", "shared-strings",
-                         "profile-hash-maps", "faces", "mappings", "regex", "registers"};
+                         "profile-hash-maps", "faces", "mappings", "regex", "registers",
+                         "background-jobs"};
                return { 0_byte, cursor_pos, complete(prefix, cursor_pos, c), Completions::Flags::Menu };
     }),
     [](const ParametersParser& parser, Context& context, const ShellContext&)
@@ -1723,6 +1724,8 @@ const CommandDesc debug_cmd = {
                     join(content | transform(quote), "\n     = ")));
             }
         }
+        else if (parser[0] == "background-jobs")
+            ShellManager::instance().debug_background_jobs();
         else
             throw runtime_error(format("no such debug command: '{}'", parser[0]));
     }

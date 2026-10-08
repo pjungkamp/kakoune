@@ -6,6 +6,7 @@
 #include "string.hh"
 #include "utils.hh"
 #include "unique_descriptor.hh"
+#include "unique_ptr.hh"
 #include "completion.hh"
 
 #include <signal.h>
@@ -49,6 +50,7 @@ class ShellManager : public Singleton<ShellManager>
 {
 public:
     ShellManager(ConstArrayView<EnvVarDesc> builtin_env_vars);
+    ~ShellManager();
 
     enum class Flags
     {
@@ -81,10 +83,16 @@ public:
 
     CandidateList complete_env_var(StringView prefix, ByteCount cursor_pos) const;
 
+    void debug_background_jobs() const;
+
 private:
+    struct BackgroundJob;
+    void remove_background_job(BackgroundJob* job);
+
     String m_shell;
 
     ConstArrayView<EnvVarDesc> m_env_vars;
+    Vector<UniquePtr<BackgroundJob>> m_background_jobs;
 };
 
 }
