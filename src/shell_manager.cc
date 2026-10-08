@@ -13,6 +13,7 @@
 #include "flags.hh"
 #include "option_types.hh"
 #include "regex.hh"
+#include "remote.hh"
 
 #include <chrono>
 #include <cstring>
@@ -233,8 +234,10 @@ struct CommandFifos
     String command;
     UniqueFd command_fd;
 
+    // The fifos live in a hidden directory of the session directory, session
+    // names cannot start with a dot so this never conflicts with a session.
     CommandFifos()
-      : base_dir(format("{}/kak-fifo.XXXXXX", tmpdir()))
+      : base_dir(format("{}/.fifo.XXXXXX", session_directory()))
     {
         if (mkdtemp(base_dir.data()) == nullptr or
             mkfifo(command_fifo_path().c_str(), 0600) != 0 or
