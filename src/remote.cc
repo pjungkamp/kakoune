@@ -640,7 +640,7 @@ static sockaddr_un session_addr(StringView session)
     return addr;
 }
 
-static int connect_to(StringView session)
+int connect_to(StringView session)
 {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     fcntl(sock, F_SETFD, FD_CLOEXEC);
@@ -753,10 +753,8 @@ bool RemoteClient::is_ui_ok() const
     return m_ui->is_ok();
 }
 
-void send_command(StringView session, StringView command)
+void send_command(int sock, StringView command)
 {
-    int sock = connect_to(session);
-    auto close_sock = OnScopeEnd([sock]{ close(sock); });
     RemoteBuffer buffer;
     {
         MsgWriter msg{buffer, MessageType::Command};

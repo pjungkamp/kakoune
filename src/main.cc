@@ -824,8 +824,7 @@ int run_server(StringView session, StringView server_init,
                 show_startup_info(local_client, global_scope.options()["startup_info_version"].get<int>());
         }
 
-        while (not terminate and
-               (not client_manager.empty() or server.negotiating() or server.is_daemon()))
+        while (not terminate and (not client_manager.empty() or server.is_daemon()))
         {
             client_manager.redraw_clients();
 
@@ -963,14 +962,48 @@ int run_pipe(StringView session)
 {
     try
     {
-        send_command(session, read_fd(0));
+        auto sock = connect_to(session);
+        auto close_sock = OnScopeEnd([sock]{ close(sock); });
+
+        auto null = UniqueFd{open("/dev/null", O_WRONLY)};
+        dup2((int)null, 1);
+        dup2((int)null, 2);
+
+        String command{};
+        while (true)
+        {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(0, &rfds);
+            FD_SET(sock, &rfds);
+            if (select(sock + 1, &rfds, nullptr, nullptr, nullptr) == -1)
+            {
+                if (errno == EINTR)
+                    continue;
+                return -1;
+            }
+
+            if (FD_ISSET(sock, &rfds))
+                return -1;
+
+            char buf[4096];
+            ssize_t size = read(0, buf, sizeof(buf));
+            if (size == 0)
+                break;
+            if (size == -1 and errno != EINTR)
+                return -1;
+            if (size > 0)
+                command += StringView{buf, buf + size};
+        }
+
+        send_command(sock, command);
+        return 0;
     }
     catch (disconnected& e)
     {
-        write_stderr(format("{}\ndisconnecting\n", e.what()));
+        write_stderr(format("{}\n", e.what()));
         return -1;
     }
-    return 0;
 }
 
 void signal_handler(int signal)

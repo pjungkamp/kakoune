@@ -42,7 +42,8 @@ private:
     Optional<int>                  m_exit_status;
 };
 
-void send_command(StringView session, StringView command);
+int connect_to(StringView session);
+void send_command(int sock, StringView command);
 String get_user_name();
 const String& session_directory();
 String session_path(StringView session, bool assume_valid = false);
@@ -55,8 +56,6 @@ struct Server : public Singleton<Server>
 
     bool rename_session(StringView name);
     void close_session(bool do_unlink = true);
-
-    bool negotiating() const { return not m_accepters.empty(); }
 
     void daemonize() { m_is_daemon = true; }
     bool is_daemon() const { return m_is_daemon; }
