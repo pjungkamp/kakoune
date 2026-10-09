@@ -190,7 +190,7 @@ FDWatcher make_reader(int fd, String& contents, OnClose&& on_close)
                     continue; // try again
 
                 watcher.disable();
-                on_close(size == 0);
+                on_close(size ? errno : 0);
                 return;
             }
             contents += StringView{buffer, buffer+size};
@@ -229,8 +229,9 @@ FDWatcher make_pipe_writer(UniqueFd& fd, const FunctionRef<StringView ()>& gener
 struct CommandFifos
 {
     String base_dir;
-    String command;
     FDWatcher command_watcher;
+    String command;
+    bool failed = false;
 
     CommandFifos(Context& context, const ShellContext& shell_context)
       : base_dir(format("{}/kak-fifo.XXXXXX", tmpdir())),
@@ -241,15 +242,32 @@ struct CommandFifos
                 throw runtime_error(format("unable to create command/response fifos, errno: {}", ::strerror(errno)));
 
             int fd = open(command_fifo_path().c_str(), O_RDONLY | O_NONBLOCK);
-            return make_reader(fd, command, [&, fd](bool graceful) {
-                if (not graceful)
+            return make_reader(fd, command, [this](int error) {
+                if (error)
                 {
-                    write_to_debug_buffer(format("error reading from command fifo '{}'", strerror(errno)));
+                    write_to_debug_buffer(format("error reading from command fifo '{}'", strerror(error)));
                     return;
                 }
-                CommandManager::instance().execute(command, context, shell_context);
-                command.clear();
-                command_watcher.reset_fd(fd);
+
+                if (not failed) {
+                    try {
+                        CommandManager::instance().execute(command, context, shell_context);
+                        command.clear();
+                    } 
+                    catch (runtime_error& err)
+                    {
+                        failed = true;
+                        write_to_debug_buffer(format("error executing from command fifo '{}'", err.what()));
+                    }
+                }
+
+                // open the new fd *before* closing the old one using dup2.
+                // this ensures that the reader count never drops to zero
+                // which could cause a writer to receive EPIPE or SIGPIPE
+                // for a write.
+                auto new_fd = open(command_fifo_path().c_str(), O_RDONLY | O_NONBLOCK);
+                command_watcher.close_fd();
+                command_watcher.reset_fd(new_fd);
             });
         }())
     {
@@ -301,8 +319,8 @@ std::pair<String, int> ShellManager::eval(
     auto wait_time = Clock::now();
 
     String stdout_contents, stderr_contents;
-    auto stdout_reader = make_reader((int)shell.out, stdout_contents, [&](bool){ shell.out.close(); });
-    auto stderr_reader = make_reader((int)shell.err, stderr_contents, [&](bool){ shell.err.close(); });
+    auto stdout_reader = make_reader((int)shell.out, stdout_contents, [&](int){ shell.out.close(); });
+    auto stderr_reader = make_reader((int)shell.err, stderr_contents, [&](int){ shell.err.close(); });
     auto stdin_writer = make_pipe_writer(shell.in, input_generator);
 
     // block SIGCHLD to make sure we wont receive it before
