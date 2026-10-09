@@ -233,7 +233,7 @@ struct CommandFifos
     FDWatcher command_watcher;
 
     CommandFifos(Context& context, const ShellContext& shell_context)
-      : base_dir(format("{}/kak-fifo.XXXXXX", tmpdir())),
+      : base_dir(format("{}/.fifo-XXXXXX", session_directory())),
         command_watcher([&] {
             if (mkdtemp(base_dir.data()) == nullptr or
                 mkfifo(command_fifo_path().c_str(), 0600) != 0 or
