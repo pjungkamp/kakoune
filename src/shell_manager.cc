@@ -257,10 +257,10 @@ struct CommandFifos
 
     ~CommandFifos()
     {
-        command_watcher.close_fd();
         unlink(command_fifo_path().c_str());
         unlink(response_fifo_path().c_str());
         rmdir(base_dir.c_str());
+        command_watcher.close_fd();
     }
 
     String command_fifo_path() const { return format("{}/command-fifo", base_dir); }
