@@ -825,7 +825,7 @@ int run_server(StringView session, StringView server_init,
         }
 
         while (not terminate and
-               (not client_manager.empty() or server.negotiating() or server.is_daemon()))
+               (not client_manager.empty() or server.is_daemon()))
         {
             client_manager.redraw_clients();
 
