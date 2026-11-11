@@ -687,7 +687,7 @@ constexpr bool with_bit_ops(Meta::Type<ServerFlags>) { return true; }
 int run_server(StringView session, StringView server_init,
                StringView client_init, StringView init_buffer, Optional<BufferCoord> init_coord,
                ServerFlags flags, UIType ui_type, DebugFlags debug_flags,
-               ConstArrayView<StringView> files)
+               ConstArrayView<String> files)
 {
     static bool terminate = false;
     set_signal_handler(SIGTERM, [](int) { terminate = true; });
@@ -1126,7 +1126,7 @@ int main(int argc, char* argv[])
                               parser.get_switch("i").value_or(StringView{}));
         }
 
-        Vector<StringView> files;
+        Vector<String> files;
         Optional<BufferCoord> init_coord;
         for (auto& name : parser)
         {
@@ -1150,7 +1150,7 @@ int main(int argc, char* argv[])
                 }
             }
 
-            files.emplace_back(name);
+            files.emplace_back(real_path(name));
         }
 
         if ((bool)parser.get_switch("c") + (bool)parser.get_switch("C") + (bool)parser.get_switch("s") > 1)
